@@ -1,0 +1,80 @@
+"""Настройка бота. Для запуска используйте bot.py, для проверки - settings.py."""
+
+import getpass
+import os
+from pathlib import Path
+
+
+# =================== КУДА ПОЛОЖИТЬ СЕРТИФИКАТЫ ===================
+# 1. Найдите папку, в которой находится ЭТОТ файл settings.py.
+# 2. Положите в ТУ ЖЕ ПАПКУ вашу Excel-таблицу certificates.xlsx.
+# 3. Если сделали это, строку ниже менять НЕ НУЖНО.
+# Таблица должна называться именно certificates.xlsx, не certificates.xlsx.xlsx.
+# В Excel назовите лист Certificates. Заголовки первой строки:
+# user_login | full_name | certificate_text
+# Со второй строки заполните данные. Один сертификат - одна строка.
+# Номера certificate_id больше не нужны: бот сам запоминает адрес и текст.
+# certificate_text - полный текст персонального сертификата.
+# Изменение адреса или текста означает новый сертификат.
+# Пробелы по краям не учитываются, регистр букв адреса не учитывается.
+
+CERTIFICATES_PATH = "certificates.xlsx"
+
+# Если таблица в ДРУГОЙ папке, замените ТОЛЬКО значение в кавычках выше.
+# Укажите полный путь, ВКЛЮЧАЯ имя файла и расширение .xlsx.
+# Windows: CERTIFICATES_PATH = "C:/GiftBot/certificates.xlsx"
+# macOS:   CERTIFICATES_PATH = "/Users/anna/Documents/GiftBot/certificates.xlsx"
+# Windows: используйте /, как в примере, вместо обратного слеша.
+# НЕ вставляйте эти примеры дополнительно: измените одну строку выше.
+
+
+def load_settings():
+    """Вернуть токен и путь для приложения; токен не печатать."""
+    folder = Path(__file__).resolve().parent
+    path = Path(CERTIFICATES_PATH).expanduser()
+    if not path.is_absolute():
+        path = folder / path
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(
+            f"Таблица сертификатов не найдена. Ожидаемый полный путь: {path}\n"
+            "Положите certificates.xlsx рядом с settings.py или откройте "
+            "settings.py и измените CERTIFICATES_PATH. "
+            "Укажите путь к файлу, а не только к папке."
+        )
+    if path.suffix.lower() != ".xlsx":
+        raise ValueError("Нужна таблица Excel .xlsx. Сохраните её в этом формате.")
+
+    # =================== КУДА ВСТАВИТЬ ТОКЕН БОТА ===================
+    # Самый простой способ: запустите проверку командой python settings.py.
+    # В macOS вместо python может потребоваться python3.
+    # Когда появится надпись «Вставьте токен бота», вставьте токен и нажмите Enter.
+    # Кавычки добавлять НЕ НУЖНО. Токен - секретная строка от администратора бота.
+    # Символы при вводе НЕ ВИДНЫ - это нормально. Не отправляйте токен в чат.
+    # Токен здесь не сохраняется: при следующем запуске его нужно ввести заново.
+    # Для постоянной работы администратор может настроить переменную окружения
+    # TELEMOST_BOT_TOKEN (все буквы латинские).
+    # В этом случае вводить токен при каждом запуске не потребуется.
+    token = os.environ.get("TELEMOST_BOT_TOKEN", "").strip()
+    if not token:
+        try:
+            token = getpass.getpass("Вставьте токен бота и нажмите Enter: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError(
+                "Токен не введён. Запустите проверку в терминале "
+                "или попросите администратора настроить TELEMOST_BOT_TOKEN."
+            ) from None
+    if not token:
+        raise ValueError("Токен пустой. Повторите запуск и вставьте токен бота.")
+    return token, path
+
+
+if __name__ == "__main__":
+    try:
+        _, certificates = load_settings()
+    except ValueError as error:
+        print(f"Настройка не завершена: {error}")
+        raise SystemExit(1)
+    print(f"Файл найден: {certificates}")
+    print("Токен получен. Его действительность и содержимое Excel ещё не проверены.")
+    print("Это только проверка настройки. Для работы бота запустите python bot.py.")
