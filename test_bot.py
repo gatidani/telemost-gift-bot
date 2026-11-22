@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bot import API, APIError, Bot, State, certificate_row, read_registry
+from bot import API, APIError, Bot, State, certificate_row, read_greeting, read_registry
 
 
 class FakeAPI:
@@ -254,6 +254,61 @@ class APITests(unittest.TestCase):
         self.response.json.assert_not_called()
 
 
+class GreetingTests(unittest.TestCase):
+    setUp = DeliveryTests.setUp
+    tearDown = DeliveryTests.tearDown
+    deliver = DeliveryTests.deliver
+    update = DeliveryTests.update
+
+    def save_greeting(self, text):
+        self.bot.greeting_path = self.folder / 'greeting.txt'
+        self.bot.greeting_path.write_text(text, encoding='utf-8')
+
+    def test_greeting_precedes_all_certificates(self):
+        self.save_greeting('С праздником!\nОт вашей команды')
+        self.deliver()
+        self.assertEqual(self.api.calls[0][1], 'С праздником!\nОт вашей команды\n\nВаши сертификаты:\n\nSecret A\n\nSecret B')
+
+    def test_edit_is_loaded_for_next_explicit_request(self):
+        self.save_greeting('Первый текст')
+        self.bot.handle(self.update())
+        self.save_greeting('Новый текст')
+        self.bot.handle(self.update(2, 11))
+        self.assertTrue(self.api.calls[0][1].startswith('Первый текст'))
+        self.assertTrue(self.api.calls[1][1].startswith('Новый текст'))
+
+    def test_edit_does_not_trigger_automatic_duplicate(self):
+        self.save_greeting('Первый текст')
+        self.deliver()
+        self.save_greeting('Новый текст')
+        self.deliver(event='second-start')
+        self.assertEqual(len(self.api.calls), 1)
+
+    def test_missing_file_reserves_nothing(self):
+        self.bot.greeting_path = self.folder / 'missing.txt'
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
+
+    def test_combined_length_checked_before_reserving(self):
+        self.save_greeting('A' * 5980)
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
+
+    def test_utf8_bom_is_supported(self):
+        self.save_greeting('\ufeffПоздравляем!')
+        self.assertEqual(read_greeting(self.bot.greeting_path), 'Поздравляем!')
+
+    def test_invalid_text_files_are_rejected(self):
+        for content in [b' ', b'{\\rtf1 example}', b'\xff\xfeinvalid']:
+            self.bot.greeting_path = self.folder / 'greeting.txt'
+            self.bot.greeting_path.write_bytes(content)
+            with self.assertRaises(ValueError):
+                read_greeting(self.bot.greeting_path)
+
+
 @unittest.skipUnless(importlib.util.find_spec('openpyxl'), 'openpyxl не установлен')
 class StartupTests(unittest.TestCase):
     def run_bot(self, folder, api, check=False, organization=7835550):
@@ -277,6 +332,7 @@ class StartupTests(unittest.TestCase):
         book.active.append(['anna@example.org', 'Test certificate'])
         book.save(folder / 'input.xlsx')
         book.close()
+        (folder / 'greeting.txt').write_text('С праздником!', encoding='utf-8')
         api = FakeAPI()
 
         def call(method, body=None):

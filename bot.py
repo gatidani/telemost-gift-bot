@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from settings import load_settings
+from settings import GREETING_PATH, load_settings
 
 BASE = Path(__file__).resolve().parent
 LOG = logging.getLogger('giftbot')
@@ -33,7 +33,21 @@ def certificate_row(login, text):
             'user_login': login, 'certificate_text': text}
 
 
-def read_registry(path):
+def read_greeting(path):
+    try:
+        text = Path(path).read_text(encoding='utf-8-sig').strip()
+    except UnicodeError:
+        raise ValueError('Сохраните greeting.txt как обычный текст в кодировке UTF-8.') from None
+    except OSError:
+        raise ValueError('Не удалось прочитать поздравление. Положите greeting.txt рядом с bot.py или проверьте GREETING_PATH в settings.py.') from None
+    if not text or text.startswith('{\\rtf'):
+        raise ValueError('Заполните greeting.txt поздравлением и сохраните как обычный текст, не RTF.')
+    if len(text) + len('Ваши сертификаты:\n\n') + 2 >= 6000:
+        raise ValueError('Поздравление слишком длинное. Сократите greeting.txt: сообщение с сертификатами должно укладываться в 6000 символов.')
+    return text
+
+
+def read_registry(path, greeting=''):
     """Проверяем всю таблицу до отправки хотя бы одного сообщения."""
     from openpyxl import load_workbook
     try:
@@ -68,15 +82,16 @@ def read_registry(path):
             seen.add(values['certificate_id'])
             result.append(values)
         for login in {r['user_login'] for r in result}:
-            if len(message([r for r in result if r['user_login'] == login])) > 6000:
-                raise ValueError('Набор сертификатов одного пользователя превышает 6000 символов. Сократите текст.')
+            if len(message([r for r in result if r['user_login'] == login], greeting)) > 6000:
+                raise ValueError('Поздравление и сертификаты одного пользователя превышают 6000 символов. Сократите текст.')
         return result
     finally:
         book.close()
 
 
-def message(rows):
-    return 'Ваши сертификаты:\n\n' + '\n\n'.join(r['certificate_text'] for r in rows)
+def message(rows, greeting=''):
+    body = 'Ваши сертификаты:\n\n' + '\n\n'.join(r['certificate_text'] for r in rows)
+    return greeting + '\n\n' + body if greeting else body
 
 
 class State:
@@ -245,8 +260,12 @@ class API:
 
 
 class Bot:
-    def __init__(self, state, api, registry, report):
+    def __init__(self, state, api, registry, report, greeting_path=None):
         self.state, self.api, self.registry, self.report = state, api, registry, report
+        self.greeting_path = greeting_path
+
+    def greeting(self):
+        return read_greeting(self.greeting_path) if self.greeting_path is not None else ''
 
     def report_status(self):
         try:
@@ -255,18 +274,21 @@ class Bot:
             LOG.error('Не удалось обновить отчёт. Закройте delivery_status.xlsx в Excel и проверьте права на папку. История сохранена в базе.')
 
     def rows(self):
-        rows = read_registry(self.registry)
+        rows = read_registry(self.registry, self.greeting())
         self.state.sync(rows)
         return rows
 
     def deliver(self, login, rows, kind, event, destination, text=None):
+        greeting = self.greeting() if text is None else ''
+        if text is None and len(message(rows, greeting)) > 6000:
+            raise ValueError('Поздравление и сертификаты превышают 6000 символов. Сократите текст.')
         reserved = self.state.reserve(login, rows, kind, event)
         if reserved is None:
             return
         attempt, selected = reserved
         self.report_status()
         try:
-            mid = self.api.send(destination, text if text is not None else message(selected), attempt)
+            mid = self.api.send(destination, text if text is not None else message(selected, greeting), attempt)
         except APIError as error:
             self.state.finish(attempt, 'unknown', error=str(error))
         else:
@@ -343,7 +365,10 @@ def main():
         state = State(BASE / 'bot_state.sqlite3')
         try:
             state.recover()
-            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx')
+            greeting_path = Path(GREETING_PATH).expanduser()
+            if not greeting_path.is_absolute():
+                greeting_path = BASE / greeting_path
+            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx', greeting_path)
             bot.report_status()
             bot.rows()
             bot.report_status()
