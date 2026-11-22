@@ -216,6 +216,49 @@ class ExcelTests(unittest.TestCase):
         book.close()
         self.assertEqual(read_registry(path)[0], certificate_row('anna@example.org', 'Secret A'))
 
+    def test_arbitrary_sheet_name(self):
+        from openpyxl import load_workbook
+        path = self.make_file([['anna@example.org', 'Secret A']])
+        book = load_workbook(path)
+        book.active.title = 'Подарки сотрудникам'
+        book.save(path)
+        book.close()
+        self.assertEqual(read_registry(path)[0], certificate_row('anna@example.org', 'Secret A'))
+
+    def test_registry_need_not_be_first_or_active_sheet(self):
+        from openpyxl import load_workbook
+        path = self.make_file([['anna@example.org', 'Secret A']])
+        book = load_workbook(path)
+        book.active.title = 'Лист1'
+        note = book.create_sheet('Инструкция', 0)
+        note.append(['Как заполнить таблицу'])
+        book.active = 0
+        book.save(path)
+        book.close()
+        self.assertEqual(len(read_registry(path)), 1)
+
+    def test_multiple_matching_sheets_are_rejected(self):
+        from openpyxl import load_workbook
+        path = self.make_file([['anna@example.org', 'Secret A']])
+        book = load_workbook(path)
+        book.copy_worksheet(book.active).title = 'Другая таблица'
+        book.save(path)
+        book.close()
+        with self.assertRaisesRegex(ValueError, 'несколько листов'):
+            read_registry(path)
+
+    def test_missing_or_duplicate_headers_are_rejected(self):
+        from openpyxl import load_workbook
+        for headers in [['Имя', 'Подарок'], ['user_login', 'user_login', 'certificate_text']]:
+            path = self.make_file([])
+            book = load_workbook(path)
+            for column, value in enumerate(headers, 1):
+                book.active.cell(1, column, value)
+            book.save(path)
+            book.close()
+            with self.assertRaisesRegex(ValueError, 'не найден лист'):
+                read_registry(path)
+
 
 class APITests(unittest.TestCase):
     def setUp(self):

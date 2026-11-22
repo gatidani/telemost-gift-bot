@@ -55,14 +55,19 @@ def read_registry(path, greeting=''):
     except Exception:
         raise ValueError('Не удалось открыть Excel. Сохраните таблицу как .xlsx.') from None
     try:
-        if 'Certificates' not in book.sheetnames:
-            raise ValueError('Назовите лист таблицы Certificates.')
-        rows = iter(book['Certificates'].iter_rows())
+        required = ['user_login', 'certificate_text']
+        candidates = []
+        for sheet in book.worksheets:
+            header = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            if all(header.count(name) == 1 for name in required):
+                candidates.append(sheet)
+        if not candidates:
+            raise ValueError('В certificates.xlsx не найден лист с уникальными заголовками user_login и certificate_text в первой строке. Имя листа может быть любым.')
+        if len(candidates) > 1:
+            raise ValueError('В certificates.xlsx несколько листов с заголовками user_login и certificate_text. Оставьте одну таблицу сертификатов; имя её листа может быть любым.')
+        rows = iter(candidates[0].iter_rows())
         header = next(rows, ())
         names = [c.value for c in header]
-        required = ['user_login', 'certificate_text']
-        if any(names.count(n) != 1 for n in required):
-            raise ValueError('Нужны уникальные заголовки: user_login, certificate_text.')
         result, seen = [], set()
         for number, cells in enumerate(rows, 2):
             if all(c.value is None for c in cells):
