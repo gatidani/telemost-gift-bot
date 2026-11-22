@@ -10,7 +10,6 @@ __pycache__/
 *.db-*
 *.sqlite*
 *.xlsx
-!/Attachments/certificates_example.xlsx
 *.xls
 *.log
 secrets/
