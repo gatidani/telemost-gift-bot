@@ -260,9 +260,10 @@ class API:
 
 
 class Bot:
-    def __init__(self, state, api, registry, report, greeting_path=None):
+    def __init__(self, state, api, registry, report, greeting_path=None, only_users=None):
         self.state, self.api, self.registry, self.report = state, api, registry, report
         self.greeting_path = greeting_path
+        self.only_users = {login.strip().casefold() for login in only_users} if only_users else None
 
     def greeting(self):
         return read_greeting(self.greeting_path) if self.greeting_path is not None else ''
@@ -275,6 +276,10 @@ class Bot:
 
     def rows(self):
         rows = read_registry(self.registry, self.greeting())
+        if self.only_users is not None:
+            if self.only_users - {row['user_login'] for row in rows}:
+                raise ValueError('Не все выбранные пользователи найдены в certificates.xlsx. Проверьте user_login; отправка не начата.')
+            rows = [row for row in rows if row['user_login'] in self.only_users]
         self.state.sync(rows)
         return rows
 
@@ -301,6 +306,8 @@ class Bot:
             return
         # Только доверенные поля API; никаких поисков по тексту сообщения.
         login = sender.get('login', '').casefold()
+        if self.only_users is not None and login not in self.only_users:
+            return
         if not login or not chat.get('id') or not isinstance(update.get('message_id'), int):
             return
         if 'text' not in update or update.get('forwarded_messages'):
@@ -325,6 +332,29 @@ class Bot:
             self.deliver(login, [r for r in rows if r['user_login'] == login], 'automatic',
                          'auto:' + str(uuid4()), {'login': login})
             time.sleep(1)
+
+    def operator_resend(self):
+        if not self.only_users:
+            raise ValueError('Для повторной отправки укажите адреса через --only-users.')
+        rows = self.rows()
+        print('ПРИНУДИТЕЛЬНАЯ ПОВТОРНАЯ ОТПРАВКА')
+        print('Будут повторно отправлены поздравление и все сертификаты из таблицы, включая ранее отправленные и unknown:')
+        for login in sorted(self.only_users):
+            count = sum(row['user_login'] == login for row in rows)
+            print(f'  {login}: сертификатов {count}')
+        try:
+            confirmed = input('Для отправки введите ОТПРАВИТЬ и нажмите Enter. Любой другой ответ отменяет действие: ')
+        except EOFError:
+            confirmed = ''
+        if confirmed.strip() != 'ОТПРАВИТЬ':
+            print('Отменено. Сообщения не отправлялись.')
+            return
+        run_id = str(uuid4())
+        for login in sorted(self.only_users):
+            self.deliver(login, [row for row in rows if row['user_login'] == login],
+                         'operator_resend', f'operator-resend:{run_id}:{login}', {'login': login})
+            time.sleep(1)
+        print('Повторная отправка завершена. Проверьте результаты в delivery_status.xlsx, включая возможные unknown.')
 
 
 class ProcessLock:
@@ -353,10 +383,15 @@ class ProcessLock:
 
 def main():
     parser = argparse.ArgumentParser(description='Бот сертификатов для Телемоста')
-    parser.add_argument('--check', action='store_true', help='Проверить таблицу и API без отправки сообщений')
-    parser.add_argument('--send-pending', action='store_true', help='Однократно отправить ещё не отправленные сертификаты')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--check', action='store_true', help='Проверить таблицу и API без отправки сообщений')
+    mode.add_argument('--send-pending', action='store_true', help='Однократно отправить ещё не отправленные сертификаты')
+    mode.add_argument('--resend', action='store_true', help='Принудительно повторить выдачу выбранным --only-users после подтверждения и завершиться')
     parser.add_argument('--organization-id', type=int, help='Проверить принадлежность бота указанной организации перед запуском')
+    parser.add_argument('--only-users', nargs='+', help='Отправлять сертификаты и отвечать только указанным корпоративным адресам')
     args = parser.parse_args()
+    if args.resend and not args.only_users:
+        parser.error('--resend требует --only-users с адресами получателей.')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     token, registry = load_settings()
     with ProcessLock():
@@ -368,7 +403,7 @@ def main():
             greeting_path = Path(GREETING_PATH).expanduser()
             if not greeting_path.is_absolute():
                 greeting_path = BASE / greeting_path
-            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx', greeting_path)
+            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx', greeting_path, args.only_users)
             bot.report_status()
             bot.rows()
             bot.report_status()
@@ -383,6 +418,9 @@ def main():
             state.put('bot_id', info['id'])
             if args.check:
                 print('Проверка успешна. Таблица и API доступны. Сообщения не отправлялись.')
+                return
+            if args.resend:
+                bot.operator_resend()
                 return
             print('Проверки пройдены. Начинается автоматическая отправка новых сертификатов.')
             bot.automatic()

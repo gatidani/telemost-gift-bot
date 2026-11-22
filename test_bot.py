@@ -311,14 +311,19 @@ class GreetingTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('openpyxl'), 'openpyxl не установлен')
 class StartupTests(unittest.TestCase):
-    def run_bot(self, folder, api, check=False, organization=7835550):
+    def run_bot(self, folder, api, check=False, organization=7835550, only_users=None, resend=False, answer='ОТПРАВИТЬ'):
         from bot import main
         args = ['bot.py', '--organization-id', str(organization)]
         if check:
             args.append('--check')
+        if resend:
+            args.append('--resend')
+        if only_users:
+            args.extend(['--only-users', *only_users])
         with patch('bot.BASE', folder), patch('bot.load_settings', return_value=('test-token', folder / 'input.xlsx')), \
-                patch('bot.API', return_value=api), patch('sys.argv', args), patch('bot.time.sleep'):
-            if check or organization != 7835550:
+                patch('bot.API', return_value=api), patch('sys.argv', args), patch('bot.time.sleep'), \
+                patch('builtins.input', return_value=answer):
+            if check or resend or organization != 7835550:
                 main()
             else:
                 with self.assertRaises(KeyboardInterrupt):
@@ -365,6 +370,108 @@ class StartupTests(unittest.TestCase):
             api = self.prepare(folder)
             with self.assertRaises(ValueError):
                 self.run_bot(folder, api, organization=123)
+            self.assertEqual(api.calls, [])
+
+    def test_only_selected_user_receives_startup_delivery(self):
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            book = load_workbook(folder / 'input.xlsx')
+            book.active.append(['other@example.org', 'Other certificate'])
+            book.save(folder / 'input.xlsx')
+            book.close()
+            self.run_bot(folder, api, only_users=['ANNA@example.org'])
+            self.assertEqual(len(api.calls), 1)
+            self.assertEqual(api.calls[0][0], {'login': 'anna@example.org'})
+
+    def test_missing_selected_user_prevents_all_delivery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            with self.assertRaises(ValueError):
+                self.run_bot(folder, api, only_users=['anna@example.org', 'missing@example.org'])
+            self.assertEqual(api.calls, [])
+
+    def test_other_users_private_requests_are_ignored(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            state = State(folder / 'state.sqlite3')
+            api = FakeAPI()
+            try:
+                bot = Bot(state, api, folder / 'missing.xlsx', folder / 'report.xlsx', only_users=['selected@example.org'])
+                bot.handle({'update_id': 1, 'message_id': 1, 'chat': {'type': 'private', 'id': 'chat'},
+                            'from': {'login': 'other@example.org', 'robot': False}, 'text': '/certificates'})
+                self.assertEqual(api.calls, [])
+            finally:
+                state.db.close()
+
+    def test_resend_requires_selected_users(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            with self.assertRaises(SystemExit) as error:
+                self.run_bot(folder, api, resend=True)
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(api.calls, [])
+
+    def test_resend_preserves_history_and_skips_other_recipients(self):
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            self.run_bot(folder, api)
+            first_payload = api.calls[0][2]
+            book = load_workbook(folder / 'input.xlsx')
+            book.active.append(['other@example.org', 'Not selected'])
+            book.save(folder / 'input.xlsx')
+            book.close()
+            self.run_bot(folder, api, resend=True, only_users=['anna@example.org'])
+            self.assertEqual(len(api.calls), 2)
+            self.assertNotEqual(api.calls[-1][2], first_payload)
+            self.assertEqual(api.calls[-1][0], {'login': 'anna@example.org'})
+            self.assertIn('С праздником!', api.calls[-1][1])
+            state = State(folder / 'bot_state.sqlite3')
+            try:
+                kinds = [row[0] for row in state.db.execute('SELECT kind FROM attempts ORDER BY rowid')]
+                self.assertEqual(kinds, ['automatic', 'operator_resend'])
+            finally:
+                state.db.close()
+
+    def test_resend_cancellation_sends_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            for answer in ['', 'нет', 'yes']:
+                self.run_bot(folder, api, resend=True, only_users=['anna@example.org'], answer=answer)
+            self.assertEqual(api.calls, [])
+
+    def test_resend_unknown_is_not_automatically_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            api.fail = True
+            self.run_bot(folder, api, resend=True, only_users=['anna@example.org'])
+            api.fail = False
+            self.run_bot(folder, api)
+            self.assertEqual(len(api.calls), 1)
+
+    def test_resend_rejects_missing_recipient_before_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            with patch('builtins.input') as prompt:
+                with self.assertRaises(ValueError):
+                    self.run_bot(folder, api, resend=True, only_users=['missing@example.org'])
+                prompt.assert_not_called()
+            self.assertEqual(api.calls, [])
+
+    def test_check_and_resend_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            with self.assertRaises(SystemExit):
+                self.run_bot(folder, api, check=True, resend=True, only_users=['anna@example.org'])
             self.assertEqual(api.calls, [])
 
 
