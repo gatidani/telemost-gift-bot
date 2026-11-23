@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from settings import GREETING_PATH, load_settings
+from settings import GREETING_IMAGE_PATH, GREETING_PATH, load_settings
 
 BASE = Path(__file__).resolve().parent
 LOG = logging.getLogger('giftbot')
@@ -45,6 +45,20 @@ def read_greeting(path):
     if len(text) + len('Ваши сертификаты:\n\n') + 2 >= 6000:
         raise ValueError('Поздравление слишком длинное. Сократите greeting.txt: сообщение с сертификатами должно укладываться в 6000 символов.')
     return text
+
+
+def read_gallery_image(path):
+    try:
+        content = Path(path).read_bytes()
+    except OSError:
+        raise ValueError('Не удалось прочитать открытку. Сохраните картинку как greeting.png рядом с bot.py или проверьте путь --image.') from None
+    if content.startswith(b'\x89PNG\r\n\x1a\n'):
+        mime = 'image/png'
+    elif content.startswith(b'\xff\xd8\xff'):
+        mime = 'image/jpeg'
+    else:
+        raise ValueError('Для открытки нужен файл PNG или JPEG. Простое изменение расширения не меняет формат файла.')
+    return (Path(path).name, content, mime)
 
 
 def read_registry(path, greeting=''):
@@ -282,11 +296,12 @@ class API:
         self.session = requests.Session()
         self.session.headers['Authorization'] = 'OAuth ' + token
 
-    def call(self, method, body=None):
+    def call(self, method, body=None, files=None):
         # Никаких автоматических повторов POST и переходов на другой адрес.
         try:
+            payload = {'json': body} if files is None else {'data': body, 'files': files}
             response = self.session.request('GET' if body is None else 'POST', self.URL + method,
-                                            json=body, timeout=(10, 35), allow_redirects=False)
+                                            **payload, timeout=(10, 35), allow_redirects=False)
         except self.transport_error:
             raise APIError('Сбой связи или TLS; результат запроса может быть неизвестен.') from None
         if response.status_code != 200:
@@ -306,11 +321,22 @@ class API:
             raise APIError('В ответе нет идентификатора отправленного сообщения.')
         return data['message_id']
 
+    def send_gallery(self, destination, text, image):
+        # В контракте sendGallery нет payload_id. На неизвестном результате
+        # защиту от повтора обеспечивает сохранённая до HTTP-запроса попытка.
+        data = self.call('messages/sendGallery/', {**destination, 'text': text},
+                         files=[('images', image)])
+        images = data.get('images')
+        if (not isinstance(data.get('message_id'), int) or not isinstance(images, list)
+                or len(images) != 1 or not isinstance(images[0], dict) or not images[0].get('file_id')):
+            raise APIError('API не подтвердил единое сообщение с одной картинкой. Проверьте результат в Телемосте; автоматического повтора не будет.')
+        return data['message_id']
 
 class Bot:
-    def __init__(self, state, api, registry, report, greeting_path=None, only_users=None):
+    def __init__(self, state, api, registry, report, greeting_path=None, only_users=None, image_path=None):
         self.state, self.api, self.registry, self.report = state, api, registry, report
         self.greeting_path = greeting_path
+        self.image_path = image_path
         self.only_users = {login.strip().casefold() for login in only_users} if only_users else None
 
     def greeting(self):
@@ -323,6 +349,8 @@ class Bot:
             LOG.error('Не удалось обновить отчёт. Закройте delivery_status.xlsx в Excel и проверьте права на папку. История сохранена в базе.')
 
     def rows(self):
+        if self.image_path is not None:
+            read_gallery_image(self.image_path)
         rows = read_registry(self.registry, self.greeting())
         if self.only_users is not None:
             if self.only_users - {row['user_login'] for row in rows}:
@@ -333,6 +361,7 @@ class Bot:
 
     def deliver(self, login, rows, kind, event, destination, text=None):
         greeting = self.greeting() if text is None else ''
+        image = read_gallery_image(self.image_path) if text is None and self.image_path is not None else None
         if text is None and len(message(rows, greeting)) > 6000:
             raise ValueError('Поздравление и сертификаты превышают 6000 символов. Сократите текст.')
         reserved = self.state.reserve(login, rows, kind, event)
@@ -341,7 +370,11 @@ class Bot:
         attempt, selected = reserved
         self.report_status()
         try:
-            mid = self.api.send(destination, text if text is not None else message(selected, greeting), attempt)
+            body = text if text is not None else message(selected, greeting)
+            if image is None:
+                mid = self.api.send(destination, body, attempt)
+            else:
+                mid = self.api.send_gallery(destination, body, image)
         except APIError as error:
             self.state.finish(attempt, 'unknown', error=str(error))
         else:
@@ -437,6 +470,7 @@ def main():
     mode.add_argument('--resend', action='store_true', help='Принудительно повторить выдачу выбранным --only-users после подтверждения и завершиться')
     parser.add_argument('--organization-id', type=int, help='Проверить принадлежность бота указанной организации перед запуском')
     parser.add_argument('--only-users', nargs='+', help='Отправлять сертификаты и отвечать только указанным корпоративным адресам')
+    parser.add_argument('--image', default=GREETING_IMAGE_PATH, help='PNG или JPEG для отправки вместе с текстом одним сообщением; относительный путь от папки bot.py')
     args = parser.parse_args()
     if args.resend and not args.only_users:
         parser.error('--resend требует --only-users с адресами получателей.')
@@ -451,7 +485,10 @@ def main():
             greeting_path = Path(GREETING_PATH).expanduser()
             if not greeting_path.is_absolute():
                 greeting_path = BASE / greeting_path
-            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx', greeting_path, args.only_users)
+            image_path = Path(args.image).expanduser() if args.image else None
+            if image_path is not None and not image_path.is_absolute():
+                image_path = BASE / image_path
+            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx', greeting_path, args.only_users, image_path)
             bot.report_status()
             bot.rows()
             bot.report_status()

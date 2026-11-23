@@ -43,6 +43,13 @@ CERTIFICATES_PATH = "certificates.xlsx"
 GREETING_PATH = "greeting.txt"
 
 
+# Открытка находится рядом с bot.py в greeting.png. PNG и JPEG поддерживаются.
+# Чтобы выбрать другой файл, измените путь или добавьте --image имя_файла.
+# Чтобы оставить только текст, явно задайте здесь пустую строку "".
+# Картинка и текст будут отправлены одним запросом sendGallery.
+GREETING_IMAGE_PATH = "greeting.png"
+
+
 def load_settings():
     """Вернуть токен и путь для приложения; токен не печатать."""
     folder = Path(__file__).resolve().parent

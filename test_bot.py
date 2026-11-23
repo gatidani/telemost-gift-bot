@@ -4,19 +4,27 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bot import API, APIError, Bot, State, certificate_row, read_greeting, read_registry
+from bot import API, APIError, Bot, State, certificate_row, read_gallery_image, read_greeting, read_registry
 
 
 class FakeAPI:
     def __init__(self):
         self.calls = []
         self.fail = False
+        self.gallery_calls = []
 
     def send(self, destination, text, attempt):
         self.calls.append((destination, text, attempt))
         if self.fail:
             raise APIError('Тайм-аут')
         return 123
+
+    def send_gallery(self, destination, text, image):
+        self.gallery_calls.append((destination, text, image))
+        if self.fail:
+            raise APIError('Тайм-аут галереи')
+        return 456
+
 
 
 class DeliveryTests(unittest.TestCase):
@@ -319,6 +327,100 @@ class APITests(unittest.TestCase):
         self.assertIn('403', str(error.exception))
         self.response.json.assert_not_called()
 
+    def test_single_image_and_text_use_one_multipart_request(self):
+        self.response.json.return_value = {'ok': True, 'message_id': 456, 'images': [{'file_id': 'image-id'}]}
+        image = ('greeting.png', b'png-data', 'image/png')
+        self.assertEqual(self.api.send_gallery({'login': 'anna@example.org'}, 'Text', image), 456)
+        self.api.session.request.assert_called_once()
+        args, kwargs = self.api.session.request.call_args
+        self.assertTrue(args[1].endswith('messages/sendGallery/'))
+        self.assertEqual(kwargs['data'], {'login': 'anna@example.org', 'text': 'Text'})
+        self.assertEqual(kwargs['files'], [('images', image)])
+        self.assertNotIn('json', kwargs)
+        self.assertFalse(kwargs['allow_redirects'])
+
+    def test_gallery_timeout_is_not_retried(self):
+        self.api.session.request.side_effect = ConnectionError()
+        with self.assertRaises(APIError):
+            self.api.send_gallery({'login': 'anna@example.org'}, 'Text', ('greeting.png', b'png', 'image/png'))
+        self.assertEqual(self.api.session.request.call_count, 1)
+
+    def test_gallery_requires_confirmation_of_image(self):
+        for response in [{'ok': True, 'message_id': 456}, {'ok': True, 'message_id': 456, 'images': []}]:
+            self.response.json.return_value = response
+            with self.assertRaises(APIError):
+                self.api.send_gallery({'login': 'anna@example.org'}, 'Text', ('greeting.png', b'png', 'image/png'))
+
+
+
+
+class GalleryDeliveryTests(unittest.TestCase):
+    setUp = DeliveryTests.setUp
+    tearDown = DeliveryTests.tearDown
+    deliver = DeliveryTests.deliver
+
+    def enable_gallery(self):
+        self.bot.image_path = self.folder / 'greeting.png'
+        self.bot.image_path.write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+        self.bot.greeting_path = self.folder / 'greeting.txt'
+        self.bot.greeting_path.write_text('{full_name}, с Новым годом!', encoding='utf-8')
+        for row in self.rows:
+            row['full_name'] = 'Иванова Анна Петровна'
+
+    def test_gallery_sends_greeting_and_certificates_without_extra_text(self):
+        self.enable_gallery()
+        self.deliver()
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(len(self.api.gallery_calls), 1)
+        self.assertIn('Иванова Анна Петровна, с Новым годом!', self.api.gallery_calls[0][1])
+        self.assertIn('Secret A', self.api.gallery_calls[0][1])
+        self.assertIn('Secret B', self.api.gallery_calls[0][1])
+        row = self.state.db.execute('SELECT status,message_id FROM attempts').fetchone()
+        self.assertEqual(tuple(row), ('sent', '456'))
+
+    def test_unknown_gallery_never_falls_back_to_text_or_retries(self):
+        self.enable_gallery()
+        self.api.fail = True
+        self.deliver()
+        self.api.fail = False
+        self.deliver(event='reconnect')
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(len(self.api.gallery_calls), 1)
+        self.assertEqual(self.state.db.execute('SELECT status FROM attempts').fetchone()[0], 'unknown')
+
+    def test_restart_skips_confirmed_gallery(self):
+        self.enable_gallery()
+        self.deliver()
+        self.state.db.close()
+        self.state = State(self.folder / 'state.sqlite3')
+        self.bot.state = self.state
+        self.state.recover()
+        self.deliver(event='restart')
+        self.assertEqual(len(self.api.gallery_calls), 1)
+
+    def test_operator_resend_sends_new_gallery(self):
+        self.enable_gallery()
+        self.deliver()
+        self.deliver(kind='operator_resend', event='new-confirmed-request')
+        self.assertEqual(len(self.api.gallery_calls), 2)
+
+    def test_missing_or_invalid_image_stops_before_reserving(self):
+        self.bot.image_path = self.folder / 'missing.png'
+        for content in [None, b'not-png']:
+            if content is not None:
+                self.bot.image_path.write_bytes(content)
+            with self.assertRaises(ValueError):
+                self.deliver()
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
+        self.assertEqual(self.api.gallery_calls, [])
+
+    def test_service_replies_remain_text_only(self):
+        self.enable_gallery()
+        self.bot.deliver('anna@example.org', [{'certificate_id': 'service'}], 'user_request', 'service',
+                         {'login': 'anna@example.org'}, text='Help')
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(self.api.gallery_calls, [])
+
 
 class GreetingTests(unittest.TestCase):
     setUp = DeliveryTests.setUp
@@ -414,9 +516,11 @@ class GreetingTests(unittest.TestCase):
                 read_greeting(self.bot.greeting_path)
 
 
+
+
 @unittest.skipUnless(importlib.util.find_spec('openpyxl'), 'openpyxl не установлен')
 class StartupTests(unittest.TestCase):
-    def run_bot(self, folder, api, check=False, organization=7835550, only_users=None, resend=False, answer='ОТПРАВИТЬ'):
+    def run_bot(self, folder, api, check=False, organization=7835550, only_users=None, resend=False, answer='ОТПРАВИТЬ', image=None):
         from bot import main
         args = ['bot.py', '--organization-id', str(organization)]
         if check:
@@ -425,9 +529,11 @@ class StartupTests(unittest.TestCase):
             args.append('--resend')
         if only_users:
             args.extend(['--only-users', *only_users])
+        if image is not None:
+            args.extend(['--image', image])
         with patch('bot.BASE', folder), patch('bot.load_settings', return_value=('test-token', folder / 'input.xlsx')), \
                 patch('bot.API', return_value=api), patch('sys.argv', args), patch('bot.time.sleep'), \
-                patch('builtins.input', return_value=answer):
+                patch('builtins.input', return_value=answer), patch('bot.GREETING_IMAGE_PATH', ''):
             if check or resend or organization != 7835550:
                 main()
             else:
@@ -468,6 +574,24 @@ class StartupTests(unittest.TestCase):
             api = self.prepare(folder)
             self.run_bot(folder, api, check=True)
             self.assertEqual(api.calls, [])
+
+    def test_resend_with_image_sends_single_gallery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            (folder / 'greeting.png').write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+            self.run_bot(folder, api, resend=True, only_users=['anna@example.org'], image='greeting.png')
+            self.assertEqual(api.calls, [])
+            self.assertEqual(len(api.gallery_calls), 1)
+
+    def test_check_with_image_never_sends(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            (folder / 'greeting.png').write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+            self.run_bot(folder, api, check=True, image='greeting.png')
+            self.assertEqual(api.calls, [])
+            self.assertEqual(api.gallery_calls, [])
 
     def test_wrong_organization_never_sends(self):
         with tempfile.TemporaryDirectory() as temp:
