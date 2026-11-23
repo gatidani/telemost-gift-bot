@@ -259,6 +259,29 @@ class ExcelTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'не найден лист'):
                 read_registry(path)
 
+    def test_names_loaded_and_merged_across_certificates(self):
+        from openpyxl import load_workbook
+        path = self.make_file([['anna@example.org', 'First'], ['anna@example.org', 'Second']])
+        book = load_workbook(path)
+        book.active['C1'] = 'full_name'
+        book.active['C3'] = 'Иванова Анна Петровна'
+        book.save(path)
+        book.close()
+        rows = read_registry(path, '{first_name}, поздравляем!')
+        self.assertTrue(all(row['full_name'] == 'Иванова Анна Петровна' for row in rows))
+
+    def test_conflicting_names_even_on_duplicate_rows_are_rejected(self):
+        from openpyxl import load_workbook
+        path = self.make_file([['anna@example.org', 'Same'], ['anna@example.org', 'Same']])
+        book = load_workbook(path)
+        book.active['C1'] = 'full_name'
+        book.active['C2'] = 'Иванова Анна'
+        book.active['C3'] = 'Иванова Елена'
+        book.save(path)
+        book.close()
+        with self.assertRaises(ValueError):
+            read_registry(path, '{first_name}')
+
 
 class APITests(unittest.TestCase):
     def setUp(self):
@@ -311,6 +334,45 @@ class GreetingTests(unittest.TestCase):
         self.save_greeting('С праздником!\nОт вашей команды')
         self.deliver()
         self.assertEqual(self.api.calls[0][1], 'С праздником!\nОт вашей команды\n\nВаши сертификаты:\n\nSecret A\n\nSecret B')
+
+    def test_first_name_is_extracted_from_surname_first(self):
+        self.save_greeting('{first_name}, поздравляем! {full_name}')
+        for row in self.rows:
+            row['full_name'] = 'Иванова Анна Петровна'
+        self.deliver()
+        self.assertTrue(self.api.calls[0][1].startswith('Анна, поздравляем! Иванова Анна Петровна'))
+
+    def test_explicit_first_name_takes_priority(self):
+        self.save_greeting('{first_name}, поздравляем!')
+        for row in self.rows:
+            row.update(full_name='Иванова Анна Петровна', first_name='Аня')
+        self.deliver()
+        self.assertTrue(self.api.calls[0][1].startswith('Аня, поздравляем!'))
+
+    def test_missing_name_prevents_attempt(self):
+        self.save_greeting('{first_name}, поздравляем!')
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
+
+    def test_name_change_does_not_repeat_automatic_delivery(self):
+        self.save_greeting('{first_name}, поздравляем!')
+        for row in self.rows:
+            row['full_name'] = 'Иванова Анна'
+        self.deliver()
+        for row in self.rows:
+            row['full_name'] = 'Иванова Анна Петровна'
+        self.deliver(event='new-start')
+        self.assertEqual(len(self.api.calls), 1)
+
+    def test_rendered_length_checked_before_reserving(self):
+        self.save_greeting('{first_name}')
+        for row in self.rows:
+            row['first_name'] = 'A' * 6000
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
 
     def test_edit_is_loaded_for_next_explicit_request(self):
         self.save_greeting('Первый текст')

@@ -68,6 +68,10 @@ def read_registry(path, greeting=''):
         rows = iter(candidates[0].iter_rows())
         header = next(rows, ())
         names = [c.value for c in header]
+        personal_fields = ['full_name', 'first_name']
+        if any(names.count(field) > 1 for field in personal_fields):
+            raise ValueError('Заголовки full_name и first_name не должны повторяться.')
+        people = {}
         result, seen = [], set()
         for number, cells in enumerate(rows, 2):
             if all(c.value is None for c in cells):
@@ -81,11 +85,27 @@ def read_registry(path, greeting=''):
             values['user_login'] = values['user_login'].casefold()
             if '@' not in values['user_login'] or any(c.isspace() for c in values['user_login']):
                 raise ValueError(f'Строка {number}: укажите полный корпоративный адрес в user_login.')
+            person = people.setdefault(values['user_login'], {})
+            for field in personal_fields:
+                if field not in names:
+                    continue
+                cell = cells[names.index(field)]
+                if cell.value is None:
+                    continue
+                if cell.data_type == 'f' or not isinstance(cell.value, str):
+                    raise ValueError(f'Строка {number}: {field} должен быть текстом, не формулой.')
+                value = ' '.join(cell.value.split())
+                if value:
+                    if person.get(field) and person[field] != value:
+                        raise ValueError(f'Строка {number}: разные значения {field} у одного user_login. Укажите одинаковые данные получателя.')
+                    person[field] = value
             values = certificate_row(values['user_login'], values['certificate_text'])
             if values['certificate_id'] in seen:
                 continue
             seen.add(values['certificate_id'])
             result.append(values)
+        for row in result:
+            row.update(people[row['user_login']])
         for login in {r['user_login'] for r in result}:
             if len(message([r for r in result if r['user_login'] == login], greeting)) > 6000:
                 raise ValueError('Поздравление и сертификаты одного пользователя превышают 6000 символов. Сократите текст.')
@@ -94,7 +114,30 @@ def read_registry(path, greeting=''):
         book.close()
 
 
+def personalize_greeting(greeting, rows):
+    if '{first_name}' not in greeting and '{full_name}' not in greeting:
+        return greeting
+    person = {}
+    for row in rows:
+        for field in ['full_name', 'first_name']:
+            if row.get(field):
+                if person.get(field) and person[field] != row[field]:
+                    raise ValueError('У одного получателя указаны разные имена. Проверьте таблицу.')
+                person[field] = row[field]
+    full_name = person.get('full_name', '')
+    parts = full_name.split()
+    first_name = person.get('first_name') or (parts[1] if len(parts) > 1 else full_name)
+    replacements = {'{first_name}': first_name, '{full_name}': full_name}
+    for marker, value in replacements.items():
+        if marker in greeting and not value:
+            raise ValueError(f'Для {marker} заполните имя получателя в certificates.xlsx: full_name в порядке Фамилия Имя Отчество или отдельный first_name для имени.')
+    # Подстановка только известных маркеров, без выполнения выражений.
+    import re
+    return re.sub(r'\{(?:first_name|full_name)\}', lambda match: replacements[match.group()], greeting)
+
+
 def message(rows, greeting=''):
+    greeting = personalize_greeting(greeting, rows)
     body = 'Ваши сертификаты:\n\n' + '\n\n'.join(r['certificate_text'] for r in rows)
     return greeting + '\n\n' + body if greeting else body
 
