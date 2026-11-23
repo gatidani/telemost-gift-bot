@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bot import API, APIError, Bot, State, certificate_row, read_gallery_image, read_greeting, read_registry
+from bot import API, APIError, Bot, State, TokenValidationError, certificate_row, read_gallery_image, read_greeting, read_registry, validate_bot_token
 
 
 class FakeAPI:
@@ -354,6 +354,53 @@ class APITests(unittest.TestCase):
 
 
 
+    def test_token_http_errors_stop_after_one_check(self):
+        for status in [401, 403, 404]:
+            with self.subTest(status=status):
+                self.api.session.request.reset_mock()
+                self.response.status_code = status
+                with self.assertRaises(TokenValidationError) as error:
+                    validate_bot_token(self.api)
+                self.assertIn(str(status), str(error.exception))
+                self.api.session.request.assert_called_once()
+                self.assertTrue(self.api.session.request.call_args.args[1].endswith('self/get'))
+
+    def test_token_requires_confirmed_bot_identity(self):
+        for data in [{'ok': False}, {'ok': True}, {'ok': True, 'id': '', 'login': 'bot'}]:
+            self.response.json.return_value = data
+            with self.assertRaises(TokenValidationError):
+                validate_bot_token(self.api)
+
+    def test_send_404_with_invalid_token_stops_fatally(self):
+        self.response.status_code = 404
+        with self.assertRaises(TokenValidationError):
+            self.api.send({'login': 'anna@example.org'}, 'Text', 'attempt-id')
+        self.assertEqual(self.api.session.request.call_count, 2)
+        self.assertTrue(self.api.session.request.call_args.args[1].endswith('self/get'))
+
+    def test_recipient_404_with_valid_token_remains_recipient_error(self):
+        from unittest.mock import Mock
+        failed = Mock(status_code=404)
+        valid = Mock(status_code=200)
+        valid.json.return_value = {'ok': True, 'id': 'bot-id', 'login': 'bot-login'}
+        self.api.session.request.side_effect = [failed, valid]
+        with self.assertRaises(APIError) as error:
+            self.api.send({'login': 'missing@example.org'}, 'Text', 'attempt-id')
+        self.assertNotIsInstance(error.exception, TokenValidationError)
+        self.assertEqual(error.exception.status_code, 404)
+
+    def test_failed_logical_send_checks_token(self):
+        from unittest.mock import Mock
+        failed = Mock(status_code=200)
+        failed.json.return_value = {'ok': False}
+        invalid = Mock(status_code=200)
+        invalid.json.return_value = {'ok': False}
+        self.api.session.request.side_effect = [failed, invalid]
+        with self.assertRaises(TokenValidationError):
+            self.api.send({'login': 'anna@example.org'}, 'Text', 'attempt-id')
+        self.assertEqual(self.api.session.request.call_count, 2)
+
+
 class GalleryDeliveryTests(unittest.TestCase):
     setUp = DeliveryTests.setUp
     tearDown = DeliveryTests.tearDown
@@ -420,6 +467,18 @@ class GalleryDeliveryTests(unittest.TestCase):
                          {'login': 'anna@example.org'}, text='Help')
         self.assertEqual(len(self.api.calls), 1)
         self.assertEqual(self.api.gallery_calls, [])
+
+
+    def test_invalid_token_stops_batch_before_next_recipient(self):
+        from unittest.mock import Mock
+        self.rows.append(certificate_row('other@example.org', 'Other certificate'))
+        self.state.sync(self.rows)
+        self.api.send = Mock(side_effect=TokenValidationError('Проверка токена не пройдена'))
+        with self.assertRaises(TokenValidationError):
+            self.bot.automatic()
+        self.api.send.assert_called_once()
+        attempts = self.state.db.execute('SELECT login,status FROM attempts').fetchall()
+        self.assertEqual([tuple(row) for row in attempts], [('anna@example.org', 'unknown')])
 
 
 class GreetingTests(unittest.TestCase):
@@ -520,6 +579,21 @@ class GreetingTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec('openpyxl'), 'openpyxl не установлен')
 class StartupTests(unittest.TestCase):
+    def test_invalid_token_is_checked_before_registry_and_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            from unittest.mock import Mock
+            api.call = Mock(side_effect=APIError('HTTP 404'))
+            with patch('bot.read_registry', side_effect=AssertionError('Registry loaded before token check')):
+                with self.assertRaises(APIError):
+                    self.run_bot(folder, api, check=True)
+            api.call.assert_called_once_with('self/get')
+            self.assertFalse((folder / 'bot_state.sqlite3').exists())
+            self.assertFalse((folder / 'delivery_status.xlsx').exists())
+            self.assertEqual(api.calls, [])
+            self.assertEqual(api.gallery_calls, [])
+
     def run_bot(self, folder, api, check=False, organization=7835550, only_users=None, resend=False, answer='ОТПРАВИТЬ', image=None):
         from bot import main
         args = ['bot.py', '--organization-id', str(organization)]

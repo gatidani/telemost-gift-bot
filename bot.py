@@ -284,7 +284,27 @@ class State:
 
 
 class APIError(Exception):
-    pass
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TokenValidationError(APIError):
+    """Доступ бота не подтверждён: дальнейшие отправки запрещены."""
+
+
+def validate_bot_token(api):
+    try:
+        info = api.call('self/get')
+    except APIError as error:
+        status = f' (HTTP {error.status_code})' if error.status_code is not None else ''
+        raise TokenValidationError(
+            f'Не удалось проверить токен через информацию о боте{status}. '
+            'Проверьте токен бота, его доступ и соединение. Отправка остановлена.',
+            status_code=error.status_code) from None
+    if not isinstance(info, dict) or not isinstance(info.get('id'), str) or not info['id'] or not isinstance(info.get('login'), str) or not info['login']:
+        raise TokenValidationError('API не вернул корректные ID и логин бота. Проверка токена не пройдена, отправка остановлена.')
+    return info
 
 
 class API:
@@ -305,12 +325,16 @@ class API:
         except self.transport_error:
             raise APIError('Сбой связи или TLS; результат запроса может быть неизвестен.') from None
         if response.status_code != 200:
-            raise APIError(f'API вернул HTTP {response.status_code}; проверьте доступ и настройки.')
+            if method.startswith('messages/') and response.status_code in (401, 403, 404):
+                validate_bot_token(self)
+            raise APIError(f'API вернул HTTP {response.status_code}; проверьте доступ и настройки.', status_code=response.status_code)
         try:
             data = response.json()
         except ValueError:
             raise APIError('Некорректный ответ API.') from None
         if not isinstance(data, dict) or data.get('ok') is not True:
+            if method.startswith('messages/') and isinstance(data, dict) and data.get('ok') is False:
+                validate_bot_token(self)
             raise APIError('API не подтвердил выполнение запроса.')
         return data
 
@@ -375,6 +399,10 @@ class Bot:
                 mid = self.api.send(destination, body, attempt)
             else:
                 mid = self.api.send_gallery(destination, body, image)
+        except TokenValidationError as error:
+            self.state.finish(attempt, 'unknown', error=str(error))
+            self.report_status()
+            raise
         except APIError as error:
             self.state.finish(attempt, 'unknown', error=str(error))
         else:
@@ -477,10 +505,21 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     token, registry = load_settings()
     with ProcessLock():
+        api = API(token)
+        print('Проверка токена бота...')
+        info = validate_bot_token(api)
+        if args.organization_id is not None and args.organization_id not in info.get('organizations', []):
+            raise ValueError('API не подтвердил принадлежность бота указанной организации. Отправка запрещена; проверьте токен и доступ бота.')
+        if info.get('webhook_url'):
+            raise ValueError('У бота настроен webhook. Попросите администратора отключить его для работы polling.')
+        print('Токен проверен. Доступ к боту подтверждён.')
         if not (BASE / 'bot_state.sqlite3').exists() and (BASE / 'delivery_status.xlsx').exists():
             raise ValueError('Найден прежний отчёт, но отсутствует история bot_state.sqlite3. Восстановите базу из резервной копии, чтобы не отправить дубли.')
         state = State(BASE / 'bot_state.sqlite3')
         try:
+            previous = state.get('bot_id', '')
+            if previous and previous != info['id']:
+                raise ValueError('Токен принадлежит другому боту. Используйте исходный токен и его историю.')
             state.recover()
             greeting_path = Path(GREETING_PATH).expanduser()
             if not greeting_path.is_absolute():
@@ -488,18 +527,10 @@ def main():
             image_path = Path(args.image).expanduser() if args.image else None
             if image_path is not None and not image_path.is_absolute():
                 image_path = BASE / image_path
-            bot = Bot(state, API(token), registry, BASE / 'delivery_status.xlsx', greeting_path, args.only_users, image_path)
+            bot = Bot(state, api, registry, BASE / 'delivery_status.xlsx', greeting_path, args.only_users, image_path)
             bot.report_status()
             bot.rows()
             bot.report_status()
-            info = bot.api.call('self/get')
-            if args.organization_id is not None and args.organization_id not in info.get('organizations', []):
-                raise ValueError('API не подтвердил принадлежность бота указанной организации. Отправка запрещена; проверьте токен и доступ бота.')
-            if info.get('webhook_url'):
-                raise ValueError('У бота настроен webhook. Попросите администратора отключить его для работы polling.')
-            previous = state.get('bot_id', '')
-            if previous and previous != info['id']:
-                raise ValueError('Токен принадлежит другому боту. Используйте исходный токен и его историю.')
             state.put('bot_id', info['id'])
             if args.check:
                 print('Проверка успешна. Таблица и API доступны. Сообщения не отправлялись.')
@@ -524,6 +555,8 @@ def main():
                             bot.handle(update)
                         state.put('offset', update['update_id'] + 1)
                     delay = 2
+                except TokenValidationError:
+                    raise
                 except (APIError, ValueError) as error:
                     LOG.error('%s', error)
                     delay = min(delay * 2, 30)
