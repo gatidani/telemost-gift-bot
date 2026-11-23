@@ -136,6 +136,34 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.api.calls), 1)
         self.assertEqual(self.state.db.execute('SELECT status FROM attempts').fetchone()[0], 'sent')
 
+    def test_progress_counts_sent_skipped_and_unknown_certificates(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import Mock
+        self.deliver()
+        self.rows.extend([certificate_row('anna@example.org', 'New'), certificate_row('other@example.org', 'Other')])
+        self.state.sync(self.rows)
+        original_send = self.api.send
+
+        def send(destination, text, attempt):
+            if destination.get('login') == 'other@example.org':
+                raise APIError('Unknown result')
+            return original_send(destination, text, attempt)
+
+        self.api.send = Mock(side_effect=send)
+        output = io.StringIO()
+        with redirect_stdout(output), patch('bot.time.sleep'):
+            counts = self.bot.automatic()
+        self.assertEqual(counts, {'sent': 1, 'skipped': 2, 'unknown': 1})
+        self.assertIn('[1/2]', output.getvalue())
+        self.assertIn('[2/2]', output.getvalue())
+        self.assertIn('без подтверждения 1', output.getvalue())
+
+    def test_end_of_input_cancels_start(self):
+        with patch('builtins.input', side_effect=EOFError):
+            self.assertFalse(self.bot.confirm_start())
+        self.assertEqual(self.api.calls, [])
+
     def test_legacy_history_survives_without_input_ids(self):
         import hashlib
         import json
@@ -351,9 +379,6 @@ class APITests(unittest.TestCase):
             with self.assertRaises(APIError):
                 self.api.send_gallery({'login': 'anna@example.org'}, 'Text', ('greeting.png', b'png', 'image/png'))
 
-
-
-
     def test_token_http_errors_stop_after_one_check(self):
         for status in [401, 403, 404]:
             with self.subTest(status=status):
@@ -399,6 +424,8 @@ class APITests(unittest.TestCase):
         with self.assertRaises(TokenValidationError):
             self.api.send({'login': 'anna@example.org'}, 'Text', 'attempt-id')
         self.assertEqual(self.api.session.request.call_count, 2)
+
+
 
 
 class GalleryDeliveryTests(unittest.TestCase):
@@ -467,7 +494,6 @@ class GalleryDeliveryTests(unittest.TestCase):
                          {'login': 'anna@example.org'}, text='Help')
         self.assertEqual(len(self.api.calls), 1)
         self.assertEqual(self.api.gallery_calls, [])
-
 
     def test_invalid_token_stops_batch_before_next_recipient(self):
         from unittest.mock import Mock
@@ -594,7 +620,7 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(api.calls, [])
             self.assertEqual(api.gallery_calls, [])
 
-    def run_bot(self, folder, api, check=False, organization=7835550, only_users=None, resend=False, answer='ОТПРАВИТЬ', image=None):
+    def run_bot(self, folder, api, check=False, organization=7835550, only_users=None, resend=False, answer=None, image=None, cancel=False, confirm=True):
         from bot import main
         args = ['bot.py', '--organization-id', str(organization)]
         if check:
@@ -605,14 +631,19 @@ class StartupTests(unittest.TestCase):
             args.extend(['--only-users', *only_users])
         if image is not None:
             args.extend(['--image', image])
+        if answer is None:
+            answer = 'ОТПРАВИТЬ' if resend else 'НАЧАТЬ'
+        input_options = {'side_effect': answer} if callable(answer) else {'return_value': answer}
         with patch('bot.BASE', folder), patch('bot.load_settings', return_value=('test-token', folder / 'input.xlsx')), \
                 patch('bot.API', return_value=api), patch('sys.argv', args), patch('bot.time.sleep'), \
-                patch('builtins.input', return_value=answer), patch('bot.GREETING_IMAGE_PATH', ''):
-            if check or resend or organization != 7835550:
+                patch('builtins.input', **input_options) as prompt, patch('bot.GREETING_IMAGE_PATH', ''), \
+                patch('bot.CONFIRM_BEFORE_SEND', confirm):
+            if check or resend or organization != 7835550 or cancel:
                 main()
             else:
                 with self.assertRaises(KeyboardInterrupt):
                     main()
+            return prompt
 
     def prepare(self, folder):
         from openpyxl import Workbook
@@ -646,8 +677,69 @@ class StartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
             api = self.prepare(folder)
-            self.run_bot(folder, api, check=True)
+            prompt = self.run_bot(folder, api, check=True)
+            prompt.assert_not_called()
             self.assertEqual(api.calls, [])
+
+    def test_startup_cancellation_does_not_send_or_poll(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            for answer in ['', 'нет']:
+                self.run_bot(folder, api, answer=answer, cancel=True)
+            self.assertEqual(api.calls, [])
+            self.assertEqual(api.gallery_calls, [])
+            state = State(folder / 'bot_state.sqlite3')
+            try:
+                self.assertEqual(state.db.execute('SELECT COUNT(*) FROM attempts').fetchone()[0], 0)
+            finally:
+                state.db.close()
+
+    def test_preview_shows_identity_file_and_counts_before_confirmation(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            output = io.StringIO()
+
+            def answer(prompt):
+                shown = output.getvalue()
+                self.assertIn('test-bot', shown)
+                self.assertIn(str((folder / 'input.xlsx').resolve()), shown)
+                self.assertIn('Найдено сертификатов после объединения дублей: 1', shown)
+                self.assertIn('Новых к отправке: 1', shown)
+                self.assertEqual(api.calls, [])
+                return 'НАЧАТЬ'
+
+            with redirect_stdout(output):
+                self.run_bot(folder, api, answer=answer)
+            self.assertEqual(len(api.calls), 1)
+
+    def test_table_changes_after_preview_do_not_expand_delivery(self):
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+
+            def answer(prompt):
+                book = load_workbook(folder / 'input.xlsx')
+                book.active.append(['not-confirmed@example.org', 'Not in approved preview'])
+                book.save(folder / 'input.xlsx')
+                book.close()
+                return 'НАЧАТЬ'
+
+            self.run_bot(folder, api, answer=answer)
+            self.assertEqual(len(api.calls), 1)
+            self.assertEqual(api.calls[0][0], {'login': 'anna@example.org'})
+
+    def test_unattended_setting_skips_start_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            api = self.prepare(folder)
+            prompt = self.run_bot(folder, api, confirm=False)
+            prompt.assert_not_called()
+            self.assertEqual(len(api.calls), 1)
 
     def test_resend_with_image_sends_single_gallery(self):
         with tempfile.TemporaryDirectory() as temp:

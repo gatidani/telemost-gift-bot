@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from settings import GREETING_IMAGE_PATH, GREETING_PATH, load_settings
+from settings import CONFIRM_BEFORE_SEND, GREETING_IMAGE_PATH, GREETING_PATH, load_settings
 
 BASE = Path(__file__).resolve().parent
 LOG = logging.getLogger('giftbot')
@@ -211,13 +211,7 @@ class State:
                 self.db.rollback()
                 return None
             if kind == 'automatic':
-                # Любая предыдущая попытка, включая явный запрос, исключает
-                # последующую автоматическую выдачу этого сертификата.
-                used = set()
-                aliases = dict(self.db.execute('SELECT id,key FROM certificate_keys'))
-                for a in self.db.execute('SELECT ids FROM attempts WHERE login=?', (login,)):
-                    used.update(aliases.get(cid, cid) for cid in json.loads(a[0]))
-                rows = [r for r in rows if r['certificate_id'] not in used]
+                rows = self.pending_rows(login, rows)
             if not rows:
                 self.db.rollback()
                 return None
@@ -229,6 +223,14 @@ class State:
         except BaseException:
             self.db.rollback()
             raise
+
+    def pending_rows(self, login, rows):
+        # Вызывается и для сводки, и повторно внутри транзакции reserve.
+        used = set()
+        aliases = dict(self.db.execute('SELECT id,key FROM certificate_keys'))
+        for attempt in self.db.execute('SELECT ids FROM attempts WHERE login=?', (login,)):
+            used.update(aliases.get(cid, cid) for cid in json.loads(attempt[0]))
+        return [row for row in rows if row['certificate_id'] not in used]
 
     def finish(self, attempt, status, message_id=None, error=None):
         with self.db:
@@ -390,7 +392,7 @@ class Bot:
             raise ValueError('Поздравление и сертификаты превышают 6000 символов. Сократите текст.')
         reserved = self.state.reserve(login, rows, kind, event)
         if reserved is None:
-            return
+            return 'skipped', 0
         attempt, selected = reserved
         self.report_status()
         try:
@@ -405,9 +407,12 @@ class Bot:
             raise
         except APIError as error:
             self.state.finish(attempt, 'unknown', error=str(error))
+            status = 'unknown'
         else:
             self.state.finish(attempt, 'sent', message_id=mid)
+            status = 'sent'
         self.report_status()
+        return status, len(selected)
 
     def handle(self, update):
         chat, sender = update.get('chat', {}), update.get('from', {})
@@ -435,17 +440,62 @@ class Bot:
         self.deliver(login, selected, 'user_request', 'message:' + chat['id'] + ':' + str(update['message_id']),
                      {'chat_id': chat['id']}, text)
 
-    def automatic(self):
-        rows = self.rows()
-        for login in sorted({r['user_login'] for r in rows}):
-            self.deliver(login, [r for r in rows if r['user_login'] == login], 'automatic',
-                         'auto:' + str(uuid4()), {'login': login})
-            time.sleep(1)
+    def preview(self, info, rows, resend=False):
+        recipients = sorted({row['user_login'] for row in rows})
+        pending = [row for login in recipients for row in self.state.pending_rows(
+            login, [row for row in rows if row['user_login'] == login])]
+        print('\nПЕРЕД ЗАПУСКОМ')
+        print(f"Бот: {info.get('display_name') or info['login']} (логин: {info['login']}, ID: {info['id']})")
+        print(f'Прочитан файл: {Path(self.registry).resolve()}')
+        print(f'Найдено сертификатов после объединения дублей: {len(rows)}; получателей: {len(recipients)}')
+        if self.only_users is not None:
+            print('Сводка относится только к адресам --only-users.')
+        if resend:
+            print(f'Принудительный повтор: к отправке {len(rows)} сертификатов, включая прежние sent и unknown.')
+        else:
+            print(f'Новых к отправке: {len(pending)}; исключено по истории: {len(rows) - len(pending)}')
+        print(f'Отчёт: {Path(self.report).resolve()}')
 
-    def operator_resend(self):
+    def confirm_start(self):
+        try:
+            answer = input('Начинаем рассылку? Введите НАЧАТЬ и нажмите Enter; любой другой ответ отменяет запуск: ')
+        except EOFError:
+            answer = ''
+        if answer.strip() != 'НАЧАТЬ':
+            print('Запуск отменён. Сообщения не отправлялись.')
+            return False
+        return True
+
+    def dispatch(self, rows, kind):
+        recipients = sorted({row['user_login'] for row in rows})
+        counts = {'sent': 0, 'skipped': 0, 'unknown': 0}
+        run_id = str(uuid4())
+        for number, login in enumerate(recipients, 1):
+            selected = [row for row in rows if row['user_login'] == login]
+            try:
+                status, attempted = self.deliver(login, selected, kind,
+                    f'{kind}:{run_id}:{login}', {'login': login})
+            except TokenValidationError:
+                print(f'[{number}/{len(recipients)}] {login}: доступ бота не подтверждён, рассылка остановлена.')
+                raise
+            counts['skipped'] += len(selected) - attempted
+            if status != 'skipped':
+                counts[status] += attempted
+            label = {'sent': 'отправлено', 'skipped': 'пропущено по истории', 'unknown': 'нет подтверждения'}[status]
+            print(f'[{number}/{len(recipients)}] {login}: {label}; осталось получателей: {len(recipients) - number}')
+            print(f"  Сертификаты: отправлено {counts['sent']}, пропущено {counts['skipped']}, без подтверждения {counts['unknown']}")
+            if attempted:
+                time.sleep(1)
+        print(f"Итог: обработано получателей {len(recipients)}; сертификатов отправлено {counts['sent']}, пропущено {counts['skipped']}, без подтверждения {counts['unknown']}. Подробности: {self.report}")
+        return counts
+
+    def automatic(self, rows=None):
+        return self.dispatch(self.rows() if rows is None else rows, 'automatic')
+
+    def operator_resend(self, rows=None):
         if not self.only_users:
             raise ValueError('Для повторной отправки укажите адреса через --only-users.')
-        rows = self.rows()
+        rows = self.rows() if rows is None else rows
         print('ПРИНУДИТЕЛЬНАЯ ПОВТОРНАЯ ОТПРАВКА')
         print('Будут повторно отправлены поздравление и все сертификаты из таблицы, включая ранее отправленные и unknown:')
         for login in sorted(self.only_users):
@@ -458,11 +508,7 @@ class Bot:
         if confirmed.strip() != 'ОТПРАВИТЬ':
             print('Отменено. Сообщения не отправлялись.')
             return
-        run_id = str(uuid4())
-        for login in sorted(self.only_users):
-            self.deliver(login, [row for row in rows if row['user_login'] == login],
-                         'operator_resend', f'operator-resend:{run_id}:{login}', {'login': login})
-            time.sleep(1)
+        self.dispatch(rows, 'operator_resend')
         print('Повторная отправка завершена. Проверьте результаты в delivery_status.xlsx, включая возможные unknown.')
 
 
@@ -529,17 +575,23 @@ def main():
                 image_path = BASE / image_path
             bot = Bot(state, api, registry, BASE / 'delivery_status.xlsx', greeting_path, args.only_users, image_path)
             bot.report_status()
-            bot.rows()
+            rows = bot.rows()
             bot.report_status()
             state.put('bot_id', info['id'])
+            bot.preview(info, rows, resend=args.resend)
             if args.check:
                 print('Проверка успешна. Таблица и API доступны. Сообщения не отправлялись.')
                 return
             if args.resend:
-                bot.operator_resend()
+                bot.operator_resend(rows)
                 return
-            print('Проверки пройдены. Начинается автоматическая отправка новых сертификатов.')
-            bot.automatic()
+            if CONFIRM_BEFORE_SEND:
+                if not bot.confirm_start():
+                    return
+            else:
+                print('Подтверждение запуска отключено в settings.py.')
+            print('Проверки пройдены. Начинается отправка новых сертификатов.')
+            bot.automatic(rows)
             if args.send_pending:
                 return
             print('Бот запущен. Автоматическая отправка завершена; статусы в delivery_status.xlsx. Повторный запрос: /certificates. Остановка: Ctrl+C.')

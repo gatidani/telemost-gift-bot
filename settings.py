@@ -50,6 +50,12 @@ GREETING_PATH = "greeting.txt"
 GREETING_IMAGE_PATH = "greeting.png"
 
 
+# По умолчанию бот показывает сводку и ждёт слова НАЧАТЬ перед рассылкой.
+# Любой другой ответ отменяет запуск. Для запуска без оператора задайте False.
+# Этот параметр не отключает подтверждение принудительного --resend.
+CONFIRM_BEFORE_SEND = True
+
+
 def load_settings():
     """Вернуть токен и путь для приложения; токен не печатать."""
     folder = Path(__file__).resolve().parent
