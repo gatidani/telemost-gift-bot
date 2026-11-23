@@ -143,6 +143,23 @@ CERTIFICATES_PATH = "/Users/anna/Documents/GiftBot/Data/certificates.xlsx"
 | `{first_name}` | Имя получателя |
 | `{full_name}` | Всё содержимое full_name |
 
+Например, при `full_name` = `Иванов Иван Петрович` текст в `greeting.txt`:
+
+```text
+{full_name}, поздравляем с Новым годом!
+```
+
+будет отправлен как:
+
+```text
+Иванов Иван Петрович, поздравляем с Новым годом!
+```
+
+Для `{full_name}` заполните столбец `full_name` в `certificates.xlsx`.
+Если отчества нет, укажите фамилию и имя. Бот вставляет ФИО целиком,
+не склоняет его и не заменяет значением столбца `first_name`.
+
+
 Например, напишите в `greeting.txt`:
 
 ```text
