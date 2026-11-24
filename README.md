@@ -35,19 +35,19 @@ uv sync --locked
 Заполните certificates.xlsx, отредактируйте greeting.txt и выполните проверку:
 
 ```sh
-uv run --locked python bot.py --check --organization-id 7835550
+uv run --locked python bot.py --check --organization-id 9999999
 ```
 
 Замените ID организации своим. Введите токен в скрытый запрос. Для работы бота:
 
 ```sh
-uv run --locked python bot.py --organization-id 7835550
+uv run --locked python bot.py --organization-id 9999999
 ```
 
 После сводки введите НАЧАТЬ. Передача других параметров остаётся прежней:
 
 ```sh
-uv run --locked python bot.py --organization-id 7835550 --resend --only-users anna@example.org
+uv run --locked python bot.py --organization-id 9999999 --resend --only-users anna@example.org
 ```
 
 Для --resend требуется отдельное подтверждение ОТПРАВИТЬ.
