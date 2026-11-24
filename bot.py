@@ -156,7 +156,8 @@ def personalize_greeting(greeting, rows):
 
 def message(rows, greeting=''):
     greeting = personalize_greeting(greeting, rows)
-    body = 'Ваши сертификаты:\n\n' + '\n\n'.join(r['certificate_text'] for r in rows)
+    title = 'Ваш сертификат' if len(rows) == 1 else 'Ваши сертификаты'
+    body = title + ':\n\n' + '\n\n'.join(r['certificate_text'] for r in rows)
     return greeting + '\n\n' + body if greeting else body
 
 

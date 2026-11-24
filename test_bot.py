@@ -101,7 +101,7 @@ class DeliveryTests(unittest.TestCase):
         self.rows.append(certificate_row('anna@example.org', 'New'))
         self.state.sync(self.rows)
         self.deliver(event='auto-2')
-        self.assertEqual(self.api.calls[-1][1], 'Ваши сертификаты:\n\nNew')
+        self.assertEqual(self.api.calls[-1][1], 'Ваш сертификат:\n\nNew')
 
     def test_group_and_robot_ignored(self):
         self.bot.handle(self.update(chat={'id': 'group', 'type': 'group'}))
@@ -536,6 +536,16 @@ class GalleryDeliveryTests(unittest.TestCase):
 
 
 class GreetingTests(unittest.TestCase):
+    def test_single_certificate_title(self):
+        from bot import message
+        result = message([certificate_row('anna@example.org', 'Gift')], 'Поздравляем!')
+        self.assertEqual(result, 'Поздравляем!\n\nВаш сертификат:\n\nGift')
+
+    def test_multiple_certificates_title(self):
+        from bot import message
+        rows = [certificate_row('anna@example.org', 'Gift A'), certificate_row('anna@example.org', 'Gift B')]
+        self.assertEqual(message(rows), 'Ваши сертификаты:\n\nGift A\n\nGift B')
+
     setUp = DeliveryTests.setUp
     tearDown = DeliveryTests.tearDown
     deliver = DeliveryTests.deliver
