@@ -628,7 +628,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('\nБот остановлен. История отправок сохранена.')
     except ModuleNotFoundError:
-        print('Не установлены библиотеки. Выполните: python -m pip install -r requirements.txt')
+        print('Не установлены библиотеки. В папке бота выполните: uv sync --locked. Затем запустите: uv run --locked python bot.py')
         raise SystemExit(1)
     except (ValueError, APIError, sqlite3.Error, OSError) as error:
         print(f'Бот остановлен: {error}')
