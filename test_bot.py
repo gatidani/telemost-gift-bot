@@ -220,6 +220,34 @@ class ExcelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_registry(self.make_file(rows))
 
+    def test_stale_excel_dimensions_do_not_hide_filled_rows(self):
+        import re
+        from zipfile import ZipFile, ZIP_DEFLATED
+        for dimension in ['A1:B1', 'A1:A1', 'A1:A1048576']:
+            with self.subTest(dimension=dimension):
+                path = self.make_file([['anna@example.org', 'First'], ['anna@example.org', 'Second']])
+                with ZipFile(path) as book:
+                    entries = {name: book.read(name) for name in book.namelist()}
+                name = 'xl/worksheets/sheet1.xml'
+                entries[name] = re.sub(rb'<dimension[^>]*/>', ('<dimension ref="' + dimension + '"/>').encode(), entries[name])
+                with ZipFile(path, 'w', ZIP_DEFLATED) as book:
+                    for name, data in entries.items():
+                        book.writestr(name, data)
+                rows = read_registry(path)
+                self.assertEqual(len(rows), 2)
+
+    def test_headers_only_has_actionable_error(self):
+        path = self.make_file([])
+        with self.assertRaises(ValueError) as error:
+            read_registry(path)
+        self.assertIn('заголовки', str(error.exception))
+        self.assertIn(str(path.resolve()), str(error.exception))
+
+    def test_incomplete_row_is_validation_error(self):
+        path = self.make_file([['anna@example.org']])
+        with self.assertRaisesRegex(ValueError, 'certificate_text'):
+            read_registry(path)
+
     def test_report_can_be_rebuilt(self):
         from openpyxl import load_workbook
         self.deliver()

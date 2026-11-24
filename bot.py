@@ -72,16 +72,18 @@ def read_registry(path, greeting=''):
         required = ['user_login', 'certificate_text']
         candidates = []
         for sheet in book.worksheets:
+            # Редактор мог оставить dimension="A1:C1" после заполнения строк.
+            # Не доверяем сохранённым границам: читаем реально записанные ячейки.
+            sheet.reset_dimensions()
             header = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
             if all(header.count(name) == 1 for name in required):
-                candidates.append(sheet)
+                candidates.append((sheet, list(header)))
         if not candidates:
             raise ValueError('В certificates.xlsx не найден лист с уникальными заголовками user_login и certificate_text в первой строке. Имя листа может быть любым.')
         if len(candidates) > 1:
             raise ValueError('В certificates.xlsx несколько листов с заголовками user_login и certificate_text. Оставьте одну таблицу сертификатов; имя её листа может быть любым.')
-        rows = iter(candidates[0].iter_rows())
-        header = next(rows, ())
-        names = [c.value for c in header]
+        sheet, names = candidates[0]
+        rows = sheet.iter_rows(min_row=2, max_col=len(names))
         personal_fields = ['full_name', 'first_name']
         if any(names.count(field) > 1 for field in personal_fields):
             raise ValueError('Заголовки full_name и first_name не должны повторяться.')
@@ -118,6 +120,8 @@ def read_registry(path, greeting=''):
                 continue
             seen.add(values['certificate_id'])
             result.append(values)
+        if not result:
+            raise ValueError(f'В файле {Path(path).resolve()} найдены только заголовки, заполненных сертификатов нет. Заполните данные со второй строки, сохраните Excel и убедитесь, что редактируете именно этот файл.')
         for row in result:
             row.update(people[row['user_login']])
         for login in {r['user_login'] for r in result}:
